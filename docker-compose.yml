@@ -1,0 +1,203 @@
+name: arr
+
+# Everything here is driven by .env - you should not need to edit this file.
+
+x-env: &env
+  PUID: ${PUID}
+  PGID: ${PGID}
+  TZ: ${TZ}
+  UMASK: "002"
+
+# qBittorrent exists twice, selected by setup.sh through COMPOSE_PROFILES:
+#   vpn   -> "qbittorrent" inside gluetun's network namespace
+#   novpn -> "qbittorrent-novpn" directly on the network (VPN_SERVICE_PROVIDER=none)
+# Either way the other apps reach it as http://qbittorrent:8080.
+x-qbittorrent: &qbittorrent
+  image: lscr.io/linuxserver/qbittorrent:latest
+  restart: unless-stopped
+  environment:
+    <<: *env
+    WEBUI_PORT: "8080"
+  volumes:
+    - ${CONFIG_DIR}/qbittorrent:/config
+    - ${DATA_DIR}/torrents:/data/torrents
+
+services:
+  # --- VPN + download client -------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun:v3
+    container_name: gluetun
+    restart: unless-stopped
+    profiles: [vpn]
+    networks:
+      default:
+        aliases: [qbittorrent]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports:
+      - "8080:8080" # qBittorrent web UI (lives in gluetun's network namespace)
+    volumes:
+      - ${CONFIG_DIR}/gluetun:/gluetun
+    environment:
+      TZ: ${TZ}
+      VPN_SERVICE_PROVIDER: ${VPN_SERVICE_PROVIDER:-protonvpn}
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: ${WIREGUARD_PRIVATE_KEY}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES:-}
+      WIREGUARD_PRESHARED_KEY: ${WIREGUARD_PRESHARED_KEY:-}
+      SERVER_REGIONS: ${VPN_SERVER_REGIONS:-}
+      SERVER_COUNTRIES: ${VPN_SERVER_COUNTRIES:-}
+      # Static forwarded port (Windscribe ephemeral port)
+      FIREWALL_VPN_INPUT_PORTS: ${VPN_INPUT_PORT:-}
+      # Automatic port forwarding (ProtonVPN only)
+      VPN_PORT_FORWARDING: ${VPN_PORT_FORWARDING:-on}
+      PORT_FORWARD_ONLY: ${VPN_PORT_FORWARDING:-on}
+      # Pushes the forwarded port into qBittorrent whenever Proton assigns one
+      VPN_PORT_FORWARDING_UP_COMMAND: >-
+        /bin/sh -c 'wget -O- --retry-connrefused --post-data "json={\"listen_port\":{{PORT}},\"current_network_interface\":\"{{VPN_INTERFACE}}\",\"random_port\":false,\"upnp\":false}" http://127.0.0.1:8080/api/v2/app/setPreferences 2>&1'
+
+  qbittorrent:
+    <<: *qbittorrent
+    container_name: qbittorrent
+    profiles: [vpn]
+    network_mode: "service:gluetun" # no VPN = no network at all
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+
+  qbittorrent-novpn:
+    <<: *qbittorrent
+    container_name: qbittorrent-novpn
+    profiles: [novpn]
+    ports:
+      - "8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    networks:
+      default:
+        aliases: [qbittorrent]
+
+  # --- Indexers ----------------------------------------------------------------
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    ports: ["9696:9696"]
+    environment:
+      <<: *env
+      PROWLARR__AUTH__APIKEY: ${PROWLARR_API_KEY}
+    volumes:
+      - ${CONFIG_DIR}/prowlarr:/config
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      LOG_LEVEL: info
+
+  # --- Library managers ----------------------------------------------------------
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    restart: unless-stopped
+    ports: ["7878:7878"]
+    environment:
+      <<: *env
+      RADARR__AUTH__APIKEY: ${RADARR_API_KEY}
+    volumes:
+      - ${CONFIG_DIR}/radarr:/config
+      - ${DATA_DIR}:/data
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    restart: unless-stopped
+    ports: ["8989:8989"]
+    environment:
+      <<: *env
+      SONARR__AUTH__APIKEY: ${SONARR_API_KEY}
+    volumes:
+      - ${CONFIG_DIR}/sonarr:/config
+      - ${DATA_DIR}:/data
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    restart: unless-stopped
+    ports: ["6767:6767"]
+    depends_on: [radarr, sonarr]
+    environment:
+      <<: *env
+    volumes:
+      - ${CONFIG_DIR}/bazarr:/config
+      - ${DATA_DIR}/media:/data/media
+
+  # --- Media servers -------------------------------------------------------------
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: plex
+    restart: unless-stopped
+    ports: ["32400:32400"]
+    environment:
+      <<: *env
+      VERSION: docker
+      PLEX_CLAIM: ${PLEX_CLAIM:-} # setup.sh asks for this at runtime
+    volumes:
+      - ${CONFIG_DIR}/plex:/config
+      - ${DATA_DIR}/media:/data/media
+    # Intel/AMD hardware transcoding (needs Plex Pass):
+    # devices: ["/dev/dri:/dev/dri"]
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    ports: ["8096:8096"]
+    environment:
+      TZ: ${TZ}
+      JELLYFIN_PublishedServerUrl: http://${HOST_IP}:8096
+    volumes:
+      - ${CONFIG_DIR}/jellyfin/config:/config
+      - ${CONFIG_DIR}/jellyfin/cache:/cache
+      - ${DATA_DIR}/media:/data/media
+    # Intel/AMD hardware transcoding (also add the host's render GID):
+    # devices: ["/dev/dri:/dev/dri"]
+    # group_add: ["992"]   # getent group render | cut -d: -f3
+
+  # --- Requests --------------------------------------------------------------------
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    restart: unless-stopped
+    init: true
+    ports: ["5055:5055"]
+    depends_on: [radarr, sonarr, plex]
+    environment:
+      TZ: ${TZ}
+      LOG_LEVEL: info
+      PORT: "5055"
+    volumes:
+      - ${CONFIG_DIR}/seerr:/app/config
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/status || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+
+  # --- Optional: AUTO_UPDATE=on ---------------------------------------
+  watchtower:
+    image: nickfedor/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    profiles: [autoupdate]
+    environment:
+      TZ: ${TZ}
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_SCHEDULE: "0 0 4 * * *"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
