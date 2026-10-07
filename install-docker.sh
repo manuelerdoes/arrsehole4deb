@@ -46,12 +46,32 @@ apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 systemctl enable --now docker
 
-# Let a regular user run docker without sudo: ./install-docker.sh [username]
+# Let a regular user run docker without sudo. Work out who that is:
+#   1. ./install-docker.sh <username>      explicit
+#   2. sudo ./install-docker.sh            the user who called sudo
+#   3. su -  then  ./install-docker.sh     the user who logged in (logname)
+#   4. the owner of this folder, or the only regular account on the system
+script_dir=$(dirname "$(readlink -f "$0")")
 user=${1:-${SUDO_USER:-}}
-if [[ -n $user && $user != root ]]; then
-  usermod -aG docker "$user"
-  echo "Added '$user' to the docker group - log out and back in (or: newgrp docker)."
+[[ -n $user && $user != root ]] || user=$(logname 2>/dev/null || true)
+[[ -n $user && $user != root ]] || user=$(stat -c %U "$script_dir" 2>/dev/null || true)
+if [[ -z $user || $user == root || $user == UNKNOWN ]]; then
+  mapfile -t humans < <(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 {print $1}')
+  user=""
+  ((${#humans[@]} == 1)) && user=${humans[0]}
 fi
+
+if [[ -n $user && $user != root ]] && id "$user" >/dev/null 2>&1; then
+  usermod -aG docker "$user"
+  echo
+  echo "User '$user' may now use Docker. ./setup.sh picks this up by itself;"
+  echo "for plain 'docker' commands log out and back in once (or run: newgrp docker)."
+else
+  echo
+  echo "Could not tell which user should run the stack. Add yours with:"
+  echo "    usermod -aG docker <username>"
+fi
+echo
 
 docker --version
 docker compose version
