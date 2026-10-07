@@ -9,7 +9,8 @@
 #   4. connects the apps to each other through their HTTP APIs
 #
 set -Eeuo pipefail
-cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+cd "$(dirname "$SELF")"
 
 ENV_FILE=.env
 FAILED=()
@@ -92,13 +93,34 @@ api() {
 }
 
 # ------------------------------------------------------------ preparation ---
+# Group membership only reaches new login sessions. If this user was added to
+# the 'docker' group but the current shell predates that, restart the script
+# under the group with sg(1) instead of making the user log out and back in.
+docker_access() {
+  docker info >/dev/null 2>&1 && return 0
+  local me
+  me=$(id -un)
+  if ! systemctl is-active --quiet docker 2>/dev/null && [[ ! -S /var/run/docker.sock ]]; then
+    die "The Docker daemon is not running (as root: systemctl enable --now docker)."
+  fi
+  if id -nG "$me" | grep -qw docker; then
+    if [[ -z ${ARR_SG_REEXEC:-} ]] && command -v sg >/dev/null; then
+      info "docker group not active in this shell yet - restarting under it"
+      export ARR_SG_REEXEC=1
+      exec sg docker -c "$(printf '%q' "$SELF")"
+    fi
+    die "Cannot talk to the Docker daemon although '$me' is in the docker group. Log out and back in, then retry."
+  fi
+  die "User '$me' is not in the 'docker' group. As root run:  usermod -aG docker $me   then start ./setup.sh again."
+}
+
 preflight() {
   local tool
   for tool in docker curl jq python3 openssl ip; do
     command -v "$tool" >/dev/null || die "'$tool' is missing - run ./install-docker.sh first."
   done
   docker compose version >/dev/null 2>&1 || die "docker compose plugin missing - run ./install-docker.sh."
-  docker info >/dev/null 2>&1 || die "Cannot talk to the Docker daemon (are you in the 'docker' group? try: newgrp docker)."
+  docker_access
   [[ -f $ENV_FILE ]] || die "No .env found:  cp .env.example .env  and fill it in."
 }
 
@@ -488,9 +510,18 @@ configure_plex() {
   px() { http -H "X-Plex-Token: $token" -H 'Accept: application/json' "$@"; }
   enc() { jq -rn --arg v "$1" '$v | @uri'; } # strict URL encoding (%20, not +)
 
-  # Right after being claimed the server still has to sign in to plex.tv; until
-  # then it answers 401/403 even to the owner's token. Wait for it to accept us.
-  local sections=""
+  # On first start the container runs a temporary, unclaimed server to process
+  # the claim and then restarts as the real one, which still has to sign in to
+  # plex.tv. Until that is done it refuses writes (403) or is briefly down, so
+  # wait until it reports being signed in.
+  local state="" sections=""
+  for ((i = 0; i < 60; i++)); do
+    state=$(px "$url/" 2>/dev/null | jq -r '.MediaContainer.myPlexSigninState // empty' 2>/dev/null) || state=""
+    [[ $state == ok ]] && break
+    sleep 3
+  done
+  [[ $state == ok ]] || warn "Plex has not confirmed its plex.tv sign-in (state: ${state:-unknown}) - trying anyway."
+
   for ((i = 0; i < 40; i++)); do
     sections=$(px "$url/library/sections" 2>/dev/null) && break
     sections=""
@@ -508,11 +539,17 @@ configure_plex() {
     local q
     q="name=$(enc "$1")&type=$2&agent=$3&scanner=$(enc "$4")&location=$(enc "$5")"
     q+="&language=$(enc "${METADATA_LANGUAGE}-${METADATA_COUNTRY}")"
-    if ! px -X POST -H 'Content-Length: 0' "$url/library/sections?$q" >/dev/null; then
-      warn "Plex refused: POST /library/sections?$q"
-      return 1
-    fi
-    info "library '$1' added"
+    local try
+    for try in 1 2 3 4 5 6; do
+      if px -X POST -H 'Content-Length: 0' "$url/library/sections?$q" >/dev/null 2>&1; then
+        info "library '$1' added"
+        return 0
+      fi
+      sleep 5
+    done
+    warn "Plex refused: POST /library/sections?$q"
+    px -X POST -H 'Content-Length: 0' "$url/library/sections?$q" >/dev/null || true # show the error
+    return 1
   }
   add_library "Movies"   movie tv.plex.agents.movie  "Plex Movie"     /data/media/movies
   add_library "TV Shows" show  tv.plex.agents.series "Plex TV Series" /data/media/tv
@@ -550,7 +587,15 @@ configure_seerr() {
   sr -X POST "$url/api/v1/auth/plex" -d "$(jq -n --arg t "$token" '{authToken: $t}')" >/dev/null
   info "signed in with your Plex account (admin)"
 
-  sr -X POST "$url/api/v1/settings/plex" -d '{"ip": "plex", "port": 32400, "useSsl": false}' >/dev/null
+  # Seerr validates the connection; give Plex time if it is still restarting.
+  local try plex_cfg='{"ip": "plex", "port": 32400, "useSsl": false}'
+  for try in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sr -X POST "$url/api/v1/settings/plex" -d "$plex_cfg" >/dev/null 2>&1 && break
+    if ((try == 12)); then
+      sr -X POST "$url/api/v1/settings/plex" -d "$plex_cfg" >/dev/null # show the error and fail
+    fi
+    sleep 5
+  done
   # Current Seerr: POST .../library/sync, then PUT .../library/{id}.
   # Older builds (Overseerr API): GET ...?sync=true, then GET ...?enable=ids.
   local lib
