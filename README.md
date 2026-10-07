@@ -16,6 +16,7 @@ connected to each other.
 | qBittorrent | 8080 | Downloads, routed through the VPN |
 | Gluetun | - | VPN container (ProtonVPN or Windscribe, WireGuard) |
 | FlareSolverr | - | Cloudflare solver for Prowlarr |
+| Caddy | 80/443 | Optional HTTPS reverse proxy for Jellyfin + Seerr |
 | Watchtower | - | Optional nightly image updates (`AUTO_UPDATE=on`) |
 
 ## Install
@@ -60,9 +61,20 @@ reconfigure the stack.
 | `VPN_SERVICE_PROVIDER` | `protonvpn`, `windscribe`, or `none` (testing only: no VPN, your IP is visible to peers) |
 | `VPN_PORT_FORWARDING` | `on` for ProtonVPN's automatic port forwarding (paid plan, NAT-PMP key) |
 | `VPN_INPUT_PORT` | Static forwarded port, e.g. a Windscribe ephemeral port |
+| `JELLYFIN_DOMAIN`, `SEERR_DOMAIN` | Publish these two apps over HTTPS (see below) |
 | `SEED_RATIO_LIMIT` | `0` stops seeding when a download completes, empty seeds forever |
 | `QUALITY_PROFILE` | Profile Seerr requests with |
 | `AUTO_UPDATE` | `on` runs Watchtower |
+
+## Remote access
+
+Set `JELLYFIN_DOMAIN` and/or `SEERR_DOMAIN` in `.env` and re-run `./setup.sh`.
+A Caddy container then serves those names over HTTPS with Let's Encrypt
+certificates and forwards to the two apps; nothing else is exposed.
+
+Requirements: DNS A records for the names pointing at your public IP, and TCP
+ports 80 and 443 forwarded from your router to this server. Use strong
+passwords for every Jellyfin account, and do not forward any other port.
 
 ## Folder layout
 
